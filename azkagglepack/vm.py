@@ -12,6 +12,7 @@ from azure.mgmt.resource.resources.models import DeploymentMode
 
 from msrestazure.azure_exceptions import CloudError
 
+SKU_D2S_V3 = "Standard_D2s_v3"
 SKU_D4S_V3 = "Standard_D4s_v3"
 SKU_D8S_V3 = "Standard_D8s_v3"
 SKU_D16S_V3 = "Standard_D16s_v3"
@@ -52,18 +53,18 @@ class AzureVM:
         self._network_client = NetworkManagementClient(self._credentials, self._subscription_id)
         self._hkn = Haikunator()
 
-        self.vm_name = vm_name if vm_name else self._hkn.haikunate(token_length=0)
-        self.group_name = group_name if group_name else vm_name
+        self.vm_name = vm_name if vm_name else "dsvm-" + self._hkn.haikunate(token_length=0)
+        self.group_name = group_name if group_name else self.vm_name
 
-        self.attach_vm()
+        self.attach()
 
-    def attach_vm(self, admin_user = None, ssh_key_file = None, ssh_pass = None):
+    def attach(self, admin_user = None, ssh_key_file = None, ssh_pass = None):
 
         if admin_user:
             assert(ssh_key_file or ssh_pass)
             self.admin_user = admin_user
             self.ssh_key_file = ssh_key_file
-            self.ssh_pass  = self.ssh_pass
+            self.ssh_pass  = ssh_pass
 
         self.group_exists = len([g for g in self._resource_client.resource_groups.list() \
                                  if g.name == self.group_name]) > 0
@@ -155,14 +156,17 @@ class AzureVM:
         deployment_async_operation.wait()
 
         if admin_pass:
-            self.attach_vm(admin_user, ssh_pass=admin_pass)
+            self.attach(admin_user, ssh_pass=admin_pass)
         else:
-            self.attach_vm()
+            self.attach()
 
         if data_disk_size_gb:
-            self.run_commands(["sudo growpart /dev/sdc 1",  "sudo resize2fs /dev/sdc1"])
+            self.resize_data_parition()
 
         return vm_name, grp_name
+
+    def resize_data_partition(self):
+        return self.run_commands(["sudo growpart /dev/sdc 1", "sudo resize2fs /dev/sdc1"])
 
     def stop(self):
         op = self._compute_client.virtual_machines.deallocate(self.group_name, self.vm_name)
@@ -171,12 +175,16 @@ class AzureVM:
 
     def start(self):
         op = self._compute_client.virtual_machines.start(self.group_name, self.vm_name)
+        op.wait()
+        return op
 
     def resize(self, new_sku):
         self.stop()
         op = self._compute_client.virtual_machines.update(self.vm_name,
                                                           self.group_name,
                                                           {"hardware_profile": {"vm_size": new_sku}})
+        op.wait()
+        return op
 
     def resizeOSDisk(self, new_size_gb):
         self.stop()
@@ -187,17 +195,28 @@ class AzureVM:
         op.wait()
         self.start()
 
-
-
     def resizeDataDisk(self, new_size_gb):
-        pass
+        self.stop()
+        disk_name = self.vm.storage_profile.data_disks[0].name
+        disk = self._compute_client.disks.get(self.group_name, disk_name)
+        disk.disk_size_gb = new_size_gb
+        op = self._compute_client.disks.create_or_update(self.group_name, disk.name, disk)
+        op.wait()
+        self.start()
+        self.resize_data_partition()
+
+        return op
 
     def run_sdk(self, commands):
-        parameters = {'command_id': 'RunShellScript',
+        params = {'command_id': 'RunShellScript',
                       "script": commands}
 
         op = self._compute_client.virtual_machines.run_command(self.group_name, self.vm_name, parameters = params)
         op.wait()
+        msg = op.result().as_dict()["value"][0]["message"]
+        stdout = msg[msg.find("[stdout]") + 8:msg.find("[stderr]")].lstrip("\n")
+        stderr = msg[msg.find("[stderr]") + 8:].lstrip("\n")
+        return [(stdout, stderr)]
 
     def run_ssh(self, commands):
         assert(hasattr(self, "admin_user"))
@@ -206,13 +225,15 @@ class AzureVM:
 
         if not hasattr(self, "_ssh_client"):
             self._ssh_client = paramiko.SSHClient()
-            self._ssh_client.load_system_host_keys()
+            #self._ssh_client.load_system_host_keys()
             self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        if hasattr(self, "ssh_key_file"):
-            self._ssh_client.connect(self.vm_hostname, self.admin_user, key_filename = self.ssh_key_file)
-        elif hasattr(self, "ssh_pass"):
-            self._ssh_client.connect(self.vm_hostname, self.admin_user, key_filename = self.ssh_key_file)
+        if hasattr(self, "ssh_key_file") and self.ssh_key_file:
+            self._ssh_client.connect(self.vm_hostname, username = self.admin_user,
+                                     key_filename = self.ssh_key_file)
+        elif hasattr(self, "ssh_pass") and self.ssh_pass:
+            self._ssh_client.connect(self.vm_hostname, username = self.admin_user,
+                                     key_filename = self.ssh_key_file)
         else:
             raise ValueError("Must specify either key file or password")
 
@@ -220,18 +241,27 @@ class AzureVM:
 
         for c in commands:
             ssh_stdin, ssh_stdout, ssh_stderr = self._ssh_client.exec_command(c)
-            responses.append((ssh_stdin, ssh_stdout, ssh_stderr))
+            resp = ("\n".join([l.rstrip("\n") for l in ssh_stdout.readlines()]),
+                              "\n".join([l.rstrip("\n") for l in ssh_stderr.readlines()]))
+            responses.append(resp)
+
+            #if len(resp[1])>0:
+            #    raise RuntimeError("Command failed: "  + resp[1])
 
         return responses
 
     def run_commands(self, commands):
         if hasattr(self, "admin_user") and (hasattr(self, "ssh_key_file") or hasattr(self, "ssh_pass")):
-            self.run_ssh(commands)
+            res = self.run_ssh(commands)
         else:
-            self.run_sdk(commands)
+            res =  self.run_sdk(commands)
+        return res
+
     def run_cmd(self, cmd):
-        self.run_commands([cmd])
+        res = self.run_commands([cmd])
+        return res
 
     def destroy(self):
         op = self._resource_client.resource_groups.delete(self.group_name)
         op.wait()
+        return op
