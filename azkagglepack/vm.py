@@ -32,6 +32,17 @@ import logging
 
 log = logging.getLogger("azkagglepack")
 
+def ssh_alive(ssh_client):
+    # use the code below if is_active() returns True
+    try:
+        transport = ssh_client.get_transport()
+        transport.send_ignore()
+        return True
+    except Exception:
+        return False
+
+
+# connection is closed
 
 class AzureVM:
     def __init__(self, vm_name=None, group_name=None, config_file=None):
@@ -161,7 +172,7 @@ class AzureVM:
             self.attach()
 
         if data_disk_size_gb:
-            self.resize_data_parition()
+            self.resize_data_partition()
 
         return vm_name, grp_name
 
@@ -218,29 +229,35 @@ class AzureVM:
         stderr = msg[msg.find("[stderr]") + 8:].lstrip("\n")
         return [(stdout, stderr)]
 
-    def run_ssh(self, commands):
-        assert(hasattr(self, "admin_user"))
-        assert(hasattr(self, "ssh_key_file") or hasattr(self, "ssh_pass"))
-        assert(hasattr(self, "vm_hostname"))
+    def ssh_connect(self):
 
         if not hasattr(self, "_ssh_client"):
             self._ssh_client = paramiko.SSHClient()
             #self._ssh_client.load_system_host_keys()
             self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        if hasattr(self, "ssh_key_file") and self.ssh_key_file:
-            self._ssh_client.connect(self.vm_hostname, username = self.admin_user,
-                                     key_filename = self.ssh_key_file)
-        elif hasattr(self, "ssh_pass") and self.ssh_pass:
-            self._ssh_client.connect(self.vm_hostname, username = self.admin_user,
-                                     key_filename = self.ssh_key_file)
-        else:
-            raise ValueError("Must specify either key file or password")
+
+        if not ssh_alive(self._ssh_client):
+            if hasattr(self, "ssh_key_file") and self.ssh_key_file:
+                self._ssh_client.connect(self.vm_hostname, username = self.admin_user,
+                                         key_filename = self.ssh_key_file)
+            elif hasattr(self, "ssh_pass") and self.ssh_pass:
+                self._ssh_client.connect(self.vm_hostname, username = self.admin_user,
+                                         key_filename = self.ssh_key_file)
+            else:
+                raise ValueError("Must specify either key file or password")
+
+    def run_ssh(self, commands, env_dict = None):
+        assert(hasattr(self, "admin_user"))
+        assert(hasattr(self, "ssh_key_file") or hasattr(self, "ssh_pass"))
+        assert(hasattr(self, "vm_hostname"))
+
+        self.ssh_connect()
 
         responses = []
 
         for c in commands:
-            ssh_stdin, ssh_stdout, ssh_stderr = self._ssh_client.exec_command(c)
+            ssh_stdin, ssh_stdout, ssh_stderr = self._ssh_client.exec_command(c, environment = env_dict)
             resp = ("\n".join([l.rstrip("\n") for l in ssh_stdout.readlines()]),
                               "\n".join([l.rstrip("\n") for l in ssh_stderr.readlines()]))
             responses.append(resp)
@@ -265,3 +282,15 @@ class AzureVM:
         op = self._resource_client.resource_groups.delete(self.group_name)
         op.wait()
         return op
+
+    def put_file(self, local_path, remote_path):
+        self.ssh_connect()
+        sftp = self._ssh_client.open_sftp()
+        sftp.put(local_path, remote_path)
+        sftp.close()
+
+    def get_file(self, remote_path, local_path):
+        self.ssh_connect()
+        sftp = self._ssh_client.open_sftp()
+        sftp.get(remote_path, local_path)
+        sftp.close()
