@@ -22,5 +22,5 @@ def clone_repo(vm, repo_addr):
 def create_links(vm, project_alias):
     remote_work_dir = f"/home/{vm.admin_user}/{project_alias}"
     remote_data_dir = f"/home/{vm.admin_user}/data/{project_alias}"
-    vm.run_commands([f"cd /home/{vm.admin_user}/data/{project_alias};ln -s {remote_data_dir} input",
+    vm.run_commands([f"cd /home/{vm.admin_user}/{project_alias};ln -s {remote_data_dir} input",
                      f"cd /home/{vm.admin_user}/notebooks;ln -s {remote_work_dir} {project_alias}"])
